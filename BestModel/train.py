@@ -1,4 +1,5 @@
 import csv
+import json
 import random
 import re
 from pathlib import Path
@@ -17,7 +18,8 @@ from model import PCLClassifier, PCLDataset, clean_text
 
 DATA_DIR = Path("data")
 MODEL_SAVE_DIR = Path("BestModel")
-PREDICTIONS_DIR = Path("predictions")
+PREDICTIONS_DIR = Path("my-predictions")
+THRESHOLD_META_PATH = MODEL_SAVE_DIR / "threshold.json"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"using {'gpu' if device.type == 'cuda' else 'cpu'}")
@@ -85,10 +87,10 @@ def read_raw_pcl():
     df = df.dropna(subset=["label_raw"]).copy()
 
     df["par_id"] = df["par_id"].astype(str)
-    df["community"] = df["keyword"].astype(str)
+    df["keyword"] = df["keyword"].astype(str)
     df["text"] = df["text"].astype(str).apply(clean_text)
     df["label"] = (df["label_raw"].astype(int) >= 2).astype(int)
-    return df[["par_id", "community", "text", "label"]]
+    return df[["par_id", "keyword", "text", "label"]]
 
 
 def rebuild_data(ids_df, raw_df, split_name):
@@ -105,7 +107,7 @@ def rebuild_data(ids_df, raw_df, split_name):
             rows.append(
                 {
                     "par_id": par_id,
-                    "community": "unknown",
+                    "keyword": "unknown",
                     "text": "",
                     "label": 0,
                 }
@@ -113,13 +115,12 @@ def rebuild_data(ids_df, raw_df, split_name):
             continue
 
         row = by_id.loc[par_id]
-        # duplicate par_id rows are not expected; if they appear, keep first
         if isinstance(row, pd.DataFrame):
             row = row.iloc[0]
         rows.append(
             {
                 "par_id": par_id,
-                "community": row["community"],
+                "keyword": row["keyword"],
                 "text": row["text"],
                 "label": int(row["label"]),
             }
@@ -141,7 +142,7 @@ def load_train_dev():
 
 
 def load_test():
-    cols = ["par_id", "art_id", "community", "country", "text"]
+    cols = ["par_id", "art_id", "keyword", "country", "text"]
     test_df = pd.read_csv(
         DATA_DIR / "task4_test.tsv",
         sep="\t",
@@ -151,10 +152,10 @@ def load_test():
         on_bad_lines="skip",
     )
     test_df["par_id"] = test_df["par_id"].astype(str)
-    test_df["community"] = test_df["community"].astype(str)
+    test_df["keyword"] = test_df["keyword"].astype(str)
     test_df["text"] = test_df["text"].astype(str).apply(clean_text)
     test_df["label"] = 0
-    return test_df[["par_id", "community", "text", "label"]]
+    return test_df[["par_id", "keyword", "text", "label"]]
 
 
 def split_internal_dev(train_df, frac, seed):
@@ -245,7 +246,7 @@ def build_augmented(train_df):
             rows.append(
                 {
                     "par_id": row["par_id"],
-                    "community": row["community"],
+                    "keyword": row["keyword"],
                     "text": aug_text,
                     "label": 1,
                 }
@@ -348,12 +349,12 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, scaler):
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        communities = batch["communities"].to(device)
+        keyword_features = batch["keywords"].to(device)
         labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
-            logits = model(input_ids, attention_mask, communities)
+            logits = model(input_ids, attention_mask, keyword_features)
             loss = criterion(logits, labels)
 
         if scaler.is_enabled():
@@ -363,7 +364,7 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, scaler):
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            # When overflow happens, optimizer.step is skipped; don't advance schedulers then.
+            
             if scaler.get_scale() >= scale_before:
                 scheduler.step()
         else:
@@ -390,10 +391,10 @@ def predict(
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        communities = batch["communities"].to(device)
+        keyword_features = batch["keywords"].to(device)
         y = batch["labels"].to(device)
         with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-            logits = model(input_ids, attention_mask, communities)
+            logits = model(input_ids, attention_mask, keyword_features)
             if criterion is not None:
                 total_loss += criterion(logits, y).item() * y.size(0)
         probs.append(torch.sigmoid(logits).float().cpu())
@@ -419,6 +420,17 @@ def save_lines(path, preds):
     with open(path, "w") as f:
         for p in preds:
             f.write(f"{int(p)}\n")
+
+
+def save_threshold_metadata(path, threshold, threshold_f1, checkpoint_threshold):
+    payload = {
+        "threshold": float(threshold),
+        "internal_val_f1_at_threshold": float(threshold_f1),
+        "checkpoint_time_threshold": float(checkpoint_threshold),
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def print_binary_metrics(title, labels, preds, with_report=False):
@@ -468,13 +480,13 @@ def main():
     final_train = final_train.sample(frac=1, random_state=SEED).reset_index(drop=True)
     print(f"final training set after augmentation has {len(final_train)} rows with {int(final_train['label'].sum())} positives")
 
-    community_columns = sorted(
+    keyword_columns = sorted(
         pd.concat(
             [
-                final_train["community"],
-                internal_dev_df["community"],
-                official_dev_df["community"],
-                test_df["community"],
+                final_train["keyword"],
+                internal_dev_df["keyword"],
+                official_dev_df["keyword"],
+                test_df["keyword"],
             ],
             ignore_index=True,
         )
@@ -483,13 +495,13 @@ def main():
         .unique()
         .tolist()
     )
-    print(f"number of community features {len(community_columns)}")
+    print(f"number of keyword features {len(keyword_columns)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    train_ds = PCLDataset(final_train, tokenizer, community_columns, MAX_LEN)
-    internal_dev_ds = PCLDataset(internal_dev_df, tokenizer, community_columns, MAX_LEN)
-    official_dev_ds = PCLDataset(official_dev_df, tokenizer, community_columns, MAX_LEN)
-    test_ds = PCLDataset(test_df, tokenizer, community_columns, MAX_LEN)
+    train_ds = PCLDataset(final_train, tokenizer, keyword_columns, MAX_LEN)
+    internal_dev_ds = PCLDataset(internal_dev_df, tokenizer, keyword_columns, MAX_LEN)
+    official_dev_ds = PCLDataset(official_dev_df, tokenizer, keyword_columns, MAX_LEN)
+    test_ds = PCLDataset(test_df, tokenizer, keyword_columns, MAX_LEN)
 
     train_sampler = inverse_sqrt_sampler(final_train["label"].tolist())
     train_loader = DataLoader(train_ds, batch_size=BS, sampler=train_sampler)
@@ -497,7 +509,7 @@ def main():
     official_dev_loader = DataLoader(official_dev_ds, batch_size=BS, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=BS, shuffle=False)
 
-    model = PCLClassifier(MODEL_NAME, n_communities=len(community_columns), dropout=DROPOUT, grad_ckpt=ENABLE_GRAD_CKPT).to(device)
+    model = PCLClassifier(MODEL_NAME, n_keywords=len(keyword_columns), dropout=DROPOUT, grad_ckpt=ENABLE_GRAD_CKPT).to(device)
     criterion = nn.BCEWithLogitsLoss(reduction="mean")
     optimizer = build_optimizer_with_llrd(model, LR, WD, LLRD_FACTOR)
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
@@ -598,6 +610,13 @@ def main():
         f"with f1 {val_best_f1:.4f}, and the threshold saved at checkpoint time "
         f"was {best_val_t_at_ckpt:.2f}"
     )
+    save_threshold_metadata(
+        THRESHOLD_META_PATH,
+        threshold=val_best_t,
+        threshold_f1=val_best_f1,
+        checkpoint_threshold=best_val_t_at_ckpt,
+    )
+    print(f"saved threshold metadata to {THRESHOLD_META_PATH}")
 
     dev_probs, dev_labels, _ = predict(model, official_dev_loader)
     dev_preds = (dev_probs >= 0.5).astype(int)

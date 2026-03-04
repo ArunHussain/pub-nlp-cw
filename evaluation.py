@@ -1,4 +1,5 @@
 import csv
+import json
 import re
 from pathlib import Path
 
@@ -26,6 +27,7 @@ PLOT_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_NAME = "roberta-large"
 MAX_LEN = 256
 BEST_MODEL = BEST_MODEL_DIR / "best_model.pt"
+THRESHOLD_META = BEST_MODEL_DIR / "threshold.json"
 BATCH_SIZE = 16
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,7 +45,7 @@ def load_raw_pcl():
     df["par_id"] = df["par_id"].astype(str)
     df["label_binary"] = (df["label"].astype(int) >= 2).astype(int)
     df["text_clean"] = df["text"].astype(str).apply(clean_text)
-    df["community"] = df["keyword"].astype(str)
+    df["keyword"] = df["keyword"].astype(str)
     return df
 
 
@@ -53,18 +55,22 @@ def load_dev_set():
     return raw[raw["par_id"].isin(dev_ids)].reset_index(drop=True)
 
 
-def get_comm_columns():
+def get_keyword_columns():
     raw = load_raw_pcl()
-    comms = set(raw["community"].dropna().unique())
+    keywords = set(raw["keyword"].dropna().unique())
 
     test_path = DATA_DIR / "task4_test.tsv"
     if test_path.exists():
-        tcols = ["par_id", "art_id", "community", "country", "text"]
+        tcols = ["par_id", "art_id", "keyword", "country", "text"]
         tdf = pd.read_csv(test_path, sep="\t", header=None, names=tcols,
                           quoting=csv.QUOTE_NONE, on_bad_lines="skip")
-        comms |= set(tdf["community"].dropna().astype(str).unique())
+        keywords |= set(tdf["keyword"].dropna().astype(str).unique())
 
-    return sorted(comms)
+    # train.py assigns keyword="unknown" for missing par_ids during rebuild_data,
+    # so this value must be present at evaluation time
+    keywords.add("unknown")
+
+    return sorted(keywords)
 
 
 @torch.no_grad()
@@ -74,9 +80,9 @@ def get_probs(model, loader):
     for batch in loader:
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
-        comms = batch["communities"].to(device)
+        keyword_features = batch["keywords"].to(device)
         with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-            logits = model(ids, mask, comms)
+            logits = model(ids, mask, keyword_features)
         all_logits.append(logits.cpu())
 
     logits = torch.cat(all_logits).squeeze(-1).float()
@@ -91,6 +97,22 @@ def find_best_threshold(probs, labels):
         if score > best_f1:
             best_f1, best_t = score, t
     return best_t, best_f1
+
+
+def load_saved_threshold():
+    if not THRESHOLD_META.exists():
+        raise FileNotFoundError(
+            f"missing {THRESHOLD_META}. Run BestModel/train.py to save the "
+            "internal-validation threshold before running evaluation.py."
+        )
+
+    with open(THRESHOLD_META) as f:
+        payload = json.load(f)
+
+    threshold = float(payload["threshold"])
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"saved threshold must be in [0,1], got {threshold}")
+    return threshold
 
 
 def plot_confusion(y_true, y_pred):
@@ -276,23 +298,37 @@ def ablation_threshold(y_true, probs, tuned_t):
     print(f"{flipped} predictions flipped, default={default_preds.sum()} tuned={tuned_preds.sum()}")
 
 
-def ablation_community(dev_df, tokenizer, model, comm_cols, threshold):
-    print("ablation: community features")
+def ablation_keyword(dev_df, tokenizer, model, keyword_cols, threshold):
+    print("ablation: keyword features")
     y_true = dev_df["label_binary"].values
 
-    full_ds = PCLDataset(dev_df, tokenizer, comm_cols, MAX_LEN, text_col="text_clean", label_col="label_binary")
+    full_ds = PCLDataset(
+        dev_df,
+        tokenizer,
+        keyword_cols,
+        MAX_LEN,
+        text_col="text_clean",
+        label_col="label_binary",
+    )
     full_probs = get_probs(model, DataLoader(full_ds, batch_size=BATCH_SIZE))
     full_preds = (full_probs >= threshold).astype(int)
 
     zeroed_df = dev_df.copy()
-    zeroed_df["community"] = "__NONE__"
-    zeroed_ds = PCLDataset(zeroed_df, tokenizer, comm_cols, MAX_LEN, text_col="text_clean", label_col="label_binary")
+    zeroed_df["keyword"] = "__NONE__"
+    zeroed_ds = PCLDataset(
+        zeroed_df,
+        tokenizer,
+        keyword_cols,
+        MAX_LEN,
+        text_col="text_clean",
+        label_col="label_binary",
+    )
     zeroed_probs = get_probs(model, DataLoader(zeroed_ds, batch_size=BATCH_SIZE))
     zeroed_preds = (zeroed_probs >= threshold).astype(int)
 
     f1_with = f1_score(y_true, full_preds, pos_label=1)
     f1_without = f1_score(y_true, zeroed_preds, pos_label=1)
-    print(f"F1 with community: {f1_with:.4f}, without: {f1_without:.4f} (delta={f1_with - f1_without:+.4f})")
+    print(f"F1 with keyword: {f1_with:.4f}, without: {f1_without:.4f} (delta={f1_with - f1_without:+.4f})")
     print(f"Precision with: {precision_score(y_true, full_preds):.4f} without: {precision_score(y_true, zeroed_preds):.4f}")
     print(f"Recall with: {recall_score(y_true, full_preds):.4f} without: {recall_score(y_true, zeroed_preds):.4f}")
     print(f"{(full_preds != zeroed_preds).sum()} predictions flipped")
@@ -336,26 +372,34 @@ def main():
     dev_df = load_dev_set()
     y_true = dev_df["label_binary"].values
     print(f"{len(dev_df)} samples, {y_true.sum()} PCL, {(y_true == 0).sum()} No PCL")
+    threshold = load_saved_threshold()
+    print(f"using saved internal-val threshold: {threshold:.2f} from {THRESHOLD_META}")
 
-    print("building community columns")
-    comm_cols = get_comm_columns()
-    print(f"{len(comm_cols)} community features")
+    print("building keyword columns")
+    keyword_cols = get_keyword_columns()
+    print(f"{len(keyword_cols)} keyword features")
 
     print("loading model and tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = PCLClassifier(MODEL_NAME, n_communities=len(comm_cols), dropout=0.3).to(device)
+    model = PCLClassifier(MODEL_NAME, n_keywords=len(keyword_cols), dropout=0.3).to(device)
     model.load_state_dict(torch.load(BEST_MODEL, map_location=device))
     model.eval()
 
     print("running inference")
-    dev_ds = PCLDataset(dev_df, tokenizer, comm_cols, MAX_LEN, text_col="text_clean", label_col="label_binary")
+    dev_ds = PCLDataset(
+        dev_df,
+        tokenizer,
+        keyword_cols,
+        MAX_LEN,
+        text_col="text_clean",
+        label_col="label_binary",
+    )
     dev_loader = DataLoader(dev_ds, batch_size=BATCH_SIZE)
     probs = get_probs(model, dev_loader)
 
-    threshold, best_f1 = find_best_threshold(probs, y_true)
     preds = (probs >= threshold).astype(int)
 
-    print(f"best threshold: {threshold:.2f}, f1={best_f1:.4f}")
+    print(f"f1 {f1_score(y_true, preds, pos_label=1):.4f}")
     print(f"precision {precision_score(y_true, preds):.4f} recall {recall_score(y_true, preds):.4f}")
     print(classification_report(y_true, preds, target_names=["No PCL", "PCL"]))
 
@@ -375,7 +419,7 @@ def main():
     per_label_analysis(dev_df, probs, threshold)
 
     ablation_threshold(y_true, probs, threshold)
-    ablation_community(dev_df, tokenizer, model, comm_cols, threshold)
+    ablation_keyword(dev_df, tokenizer, model, keyword_cols, threshold)
 
     print(f"all plots saved to {PLOT_DIR}/")
 

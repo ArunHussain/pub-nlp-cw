@@ -17,14 +17,14 @@ def clean_text(text):
 
 
 class PCLClassifier(nn.Module):
-    def __init__(self, model_name, n_communities, dropout, grad_ckpt=False):
+    def __init__(self, model_name, n_keywords, dropout, grad_ckpt=False):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name, return_dict=True)
         if grad_ckpt:
             self.backbone.gradient_checkpointing_enable()
 
         hidden_size = self.backbone.config.hidden_size
-        merged = hidden_size + n_communities
+        merged = hidden_size + n_keywords
 
         self.hidden = nn.Linear(merged, merged)
         self.classifier = nn.Linear(merged, 1)
@@ -33,13 +33,13 @@ class PCLClassifier(nn.Module):
         nn.init.xavier_uniform_(self.hidden.weight)
         nn.init.xavier_uniform_(self.classifier.weight)
 
-    def forward(self, input_ids, attention_mask, communities):
+    def forward(self, input_ids, attention_mask, keywords):
         output = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         hidden = output.last_hidden_state
         mask = attention_mask.unsqueeze(-1).type_as(hidden)
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
         pooled = self.dropout(pooled)
-        x = torch.cat((pooled, communities), dim=1)
+        x = torch.cat((pooled, keywords), dim=1)
         x = self.hidden(x)
         x = F.relu(x)
         x = self.dropout(x)
@@ -47,16 +47,16 @@ class PCLClassifier(nn.Module):
 
 
 class PCLDataset(Dataset):
-    def __init__(self, df, tokenizer, community_columns, max_len, text_col="text", label_col="label"):
+    def __init__(self, df, tokenizer, keyword_columns, max_len, text_col="text", label_col="label"):
         self.df = df.reset_index(drop=True).copy()
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.text_col = text_col
         self.label_col = label_col
 
-        dummies = pd.get_dummies(self.df["community"])
-        dummies = dummies.reindex(columns=community_columns, fill_value=0)
-        self.community_matrix = dummies.astype(np.float32).values
+        dummies = pd.get_dummies(self.df["keyword"])
+        dummies = dummies.reindex(columns=keyword_columns, fill_value=0)
+        self.keyword_matrix = dummies.astype(np.float32).values
 
     def __len__(self):
         return len(self.df)
@@ -75,6 +75,6 @@ class PCLDataset(Dataset):
         return {
             "input_ids": enc["input_ids"].flatten(),
             "attention_mask": enc["attention_mask"].flatten(),
-            "communities": torch.tensor(self.community_matrix[idx], dtype=torch.float32),
+            "keywords": torch.tensor(self.keyword_matrix[idx], dtype=torch.float32),
             "labels": torch.tensor([float(row[self.label_col])], dtype=torch.float32),
         }
