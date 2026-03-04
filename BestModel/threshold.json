@@ -1,0 +1,5 @@
+{
+  "checkpoint_time_threshold": 0.34000000000000014,
+  "internal_val_f1_at_threshold": 0.5723076923076923,
+  "threshold": 0.34000000000000014
+}
