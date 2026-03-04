@@ -3,7 +3,7 @@ name = "nlp-cw"
 version = "0.1.0"
 description = "nlp coursework"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.12.0",
     "matplotlib>=3.10.8",
@@ -14,9 +14,7 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "sentencepiece>=0.2.1",
-    "simpletransformers==0.63.11",
     "spacy>=3.8.11",
-    "tensorflow>=2.20.0",
     "torch>=2.10.0",
-    "transformers==4.28.1",
+    "transformers>=5.2.0",
 ]
