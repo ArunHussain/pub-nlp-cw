@@ -334,6 +334,37 @@ def ablation_keyword(dev_df, tokenizer, model, keyword_cols, threshold):
     print(f"{(full_preds != zeroed_preds).sum()} predictions flipped")
 
 
+def ablation_text_cleaning(dev_df, tokenizer, model, keyword_cols, threshold):
+    print("ablation on text cleaning")
+    y_true = dev_df["label_binary"].values
+
+    # with cleaning
+    clean_ds = PCLDataset(
+        dev_df, tokenizer, keyword_cols, MAX_LEN,
+        text_col="text_clean", label_col="label_binary",
+    )
+    clean_probs = get_probs(model, DataLoader(clean_ds, batch_size=BATCH_SIZE))
+    clean_preds = (clean_probs >= threshold).astype(int)
+
+    # without cleaning
+    raw_ds = PCLDataset(
+        dev_df, tokenizer, keyword_cols, MAX_LEN,
+        text_col="text", label_col="label_binary",
+    )
+    raw_probs = get_probs(model, DataLoader(raw_ds, batch_size=BATCH_SIZE))
+    raw_preds = (raw_probs >= threshold).astype(int)
+
+    for name, fn in [("F1", f1_score), ("Precision", precision_score), ("Recall", recall_score)]:
+        c = fn(y_true, clean_preds, pos_label=1, zero_division=0)
+        r = fn(y_true, raw_preds, pos_label=1, zero_division=0)
+        print(f"  {name}: cleaned={c:.4f}, raw={r:.4f} (delta={c - r:+.4f})")
+
+    flipped = (clean_preds != raw_preds).sum()
+    print(f"{flipped} predictions flipped")
+    prob_diff = np.abs(clean_probs - raw_probs)
+    print(f"mean prob diff: {prob_diff.mean():.4f}, max: {prob_diff.max():.4f}")
+
+
 def per_label_analysis(dev_df, probs, threshold):
     print("performance by original label severity (0-4)")
     print("0,1 = no PCL    2,3,4 = PCL")
@@ -420,6 +451,7 @@ def main():
 
     ablation_threshold(y_true, probs, threshold)
     ablation_keyword(dev_df, tokenizer, model, keyword_cols, threshold)
+    ablation_text_cleaning(dev_df, tokenizer, model, keyword_cols, threshold)
 
     print(f"all plots saved to {PLOT_DIR}/")
 
