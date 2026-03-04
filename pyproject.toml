@@ -1,0 +1,20 @@
+[project]
+name = "nlp-cw"
+version = "0.1.0"
+description = "nlp coursework"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "accelerate>=1.12.0",
+    "matplotlib>=3.10.8",
+    "nltk>=3.9.3",
+    "numpy>=2.4.2",
+    "pandas>=3.0.1",
+    "protobuf>=7.34.0",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "sentencepiece>=0.2.1",
+    "spacy>=3.8.11",
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
+]
